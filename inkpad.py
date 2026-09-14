@@ -509,7 +509,7 @@ class IconButton(QPushButton):
     """Flat circular button that paints a vector icon."""
     doubleClicked = pyqtSignal()
 
-    def __init__(self, name, tip="", size=40, parent=None):
+    def __init__(self, name, tip="", size=40, parent=None, icon_color=None):
         super().__init__(parent)
         self.name = name
         self.setToolTip(tip)
@@ -518,6 +518,11 @@ class IconButton(QPushButton):
         self.setFlat(True)
         self.setStyleSheet("border:none;background:transparent;")
         self._hover = False
+        # Buttons on the light paper background use the default dark
+        # "ink" colour. Buttons on a dark surface (the screen-annotation
+        # toolbar) pass a light colour here instead, otherwise the icon
+        # is nearly invisible against a dark background.
+        self._icon_color = QColor(icon_color) if icon_color else QColor(INK_UI)
 
     def enterEvent(self, e):
         self._hover = True
@@ -545,7 +550,7 @@ class IconButton(QPushButton):
                 p.setPen(Qt.PenStyle.NoPen)
                 p.setBrush(QColor(0, 0, 0, 18))
                 p.drawEllipse(r.adjusted(2, 2, -2, -2))
-            color = QColor(INK_UI)
+            color = QColor(self._icon_color)
             if not self.isEnabled():
                 color.setAlpha(70)
         inset = self.width() * 0.29
@@ -1206,10 +1211,17 @@ class OverlayCanvas(QWidget):
 
 
 class OverlayToolbar(QFrame):
-    def __init__(self, overlay, on_close):
+    # This bar always sits on a dark background (#22262d), so its icons
+    # need to be light - the default dark "ink" colour IconButton uses
+    # for the light paper background would be nearly invisible here.
+    ICON_COLOR = "#eef1f5"
+
+    def __init__(self, overlay, on_close, on_capture):
         super().__init__(overlay)
         self.overlay = overlay
         self.on_close = on_close
+        self.on_capture = on_capture
+        self.captured = False
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint
                             | Qt.WindowType.WindowStaysOnTopHint
                             | Qt.WindowType.Tool)
@@ -1227,13 +1239,14 @@ class OverlayToolbar(QFrame):
         lay.setSpacing(6)
 
         def add(name, tip, cb, checkable=False):
-            b = IconButton(name, tip, 34, self)
+            b = IconButton(name, tip, 34, self, icon_color=self.ICON_COLOR)
             b.setCheckable(checkable)
             b.clicked.connect(lambda: cb())
             lay.addWidget(b)
             return b
 
-        self.b_pen = add("pen", "Pen", self.pick_pen, checkable=True)
+        self.b_pen = add("pen", "Pen - tap to capture the screen and start drawing",
+                         self.pick_pen, checkable=True)
         self.b_pen.setChecked(True)
 
         self.b_color = ColorButton(28, self)
@@ -1249,13 +1262,45 @@ class OverlayToolbar(QFrame):
         lay.addWidget(self.slider)
 
         self.b_eraser = add("eraser", "Eraser", self.pick_eraser, checkable=True)
-        add("trash", "Clear all ink", overlay.clear)
-        add("save", "Save annotated screenshot", self.save_screenshot)
+        self.b_trash = add("trash", "Clear all ink", overlay.clear)
+        self.b_save = add("save", "Save annotated screenshot", self.save_screenshot)
         add("close", "Discard drawing & close (Esc)", self.close_overlay)
+
+        # There's nothing on screen to erase/clear/save until the
+        # screenshot has actually been taken (see pick_pen below), so
+        # these stay disabled until then.
+        self.b_eraser.setEnabled(False)
+        self.b_trash.setEnabled(False)
+        self.b_save.setEnabled(False)
 
         self.adjustSize()
 
     def pick_pen(self):
+        # The FIRST press of the pen button is what captures the screen -
+        # this gives the tutor a chance to switch to whatever window,
+        # slide, or app they actually want to write over before anything
+        # is grabbed. Later presses just reselect the pen tool.
+        self.on_capture()
+        self.overlay.tool = "pen"
+        self.b_pen.setChecked(True)
+        self.b_eraser.setChecked(False)
+
+    def set_captured(self):
+        """Called once the screenshot has actually been taken - unlocks
+        the tools that only make sense once there's something on screen
+        to erase, clear, or save."""
+        self.captured = True
+        self.b_eraser.setEnabled(True)
+        self.b_trash.setEnabled(True)
+        self.b_save.setEnabled(True)
+
+    def reset_for_new_session(self):
+        """Back to the freshly-armed, not-yet-captured state. Used when
+        annotate mode is closed and then started again."""
+        self.captured = False
+        self.b_eraser.setEnabled(False)
+        self.b_trash.setEnabled(False)
+        self.b_save.setEnabled(False)
         self.overlay.tool = "pen"
         self.b_pen.setChecked(True)
         self.b_eraser.setChecked(False)
@@ -2028,17 +2073,22 @@ class InkPad(QMainWindow):
 
     def start_overlay(self):
         self.showMinimized()
-        QTimer.singleShot(150, self._show_overlay_after_minimize)
+        QTimer.singleShot(150, self._arm_overlay)
 
-    def _show_overlay_after_minimize(self):
+    def _arm_overlay(self):
+        """Enter annotate-screen mode WITHOUT taking a screenshot yet.
+        Only the small floating toolbar appears (it stays on top), so
+        the tutor is free to switch to whatever window, app, or slide
+        they actually want to write over first. The screenshot itself
+        is only taken the first time they press the pen tool - see
+        capture_overlay()."""
         if self._overlay is None:
             self._overlay = OverlayCanvas(on_escape=self.stop_overlay)
-            self._overlay_bar = OverlayToolbar(self._overlay, self.stop_overlay)
-
-        self._overlay.freeze()
-        self._overlay.show()
-        self._overlay.setFocus()
-        self._overlay.activateWindow()
+            self._overlay_bar = OverlayToolbar(self._overlay, self.stop_overlay,
+                                               self.capture_overlay)
+        else:
+            self._overlay.discard()
+            self._overlay_bar.reset_for_new_session()
 
         bar = self._overlay_bar
         bar.adjustSize()
@@ -2046,6 +2096,27 @@ class InkPad(QMainWindow):
         bar.move(screen.center().x() - bar.width() // 2, screen.top() + 24)
         bar.show()
         bar.raise_()
+        bar.activateWindow()
+
+    def capture_overlay(self):
+        """Actually grab the screen and reveal the drawing surface. Runs
+        the first time the pen tool is pressed after arming annotate
+        mode; does nothing on subsequent presses."""
+        if self._overlay is None or self._overlay_bar.captured:
+            return
+        bar = self._overlay_bar
+        # Hide the toolbar for the instant of the grab so it doesn't get
+        # baked into the captured background image itself.
+        bar.hide()
+        QApplication.processEvents()
+        self._overlay.freeze()
+        bar.show()
+        bar.raise_()
+
+        self._overlay.show()
+        self._overlay.setFocus()
+        self._overlay.activateWindow()
+        bar.set_captured()
 
     def stop_overlay(self):
         if self._overlay:
@@ -2053,6 +2124,7 @@ class InkPad(QMainWindow):
             self._overlay.discard()
         if self._overlay_bar:
             self._overlay_bar.hide()
+            self._overlay_bar.reset_for_new_session()
         self.showNormal()
         self.activateWindow()
 
