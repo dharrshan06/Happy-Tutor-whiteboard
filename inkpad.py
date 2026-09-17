@@ -1081,6 +1081,13 @@ class Canvas(QWidget):
 # ----------------------------------------------------------------------------
 
 class OverlayCanvas(QWidget):
+    """A screen-annotation session. Can hold several 'pages' - each one a
+    frozen screenshot plus whatever's drawn on top of it - so a tutor can
+    capture more than one screen in the same annotate-screen session and
+    flip back through earlier ones. self.background and self.strokes
+    always refer to the CURRENT page, so the drawing/erasing code below
+    doesn't need to know pages exist at all."""
+
     def __init__(self, on_escape=None):
         super().__init__()
         self.on_escape = on_escape
@@ -1093,14 +1100,92 @@ class OverlayCanvas(QWidget):
         self.setCursor(Qt.CursorShape.CrossCursor)
         self.setGeometry(QApplication.primaryScreen().geometry())
 
-        self.background = None
-        self.strokes = []
+        self.pages = [self._blank_page()]
+        self.index = 0
         self.current = None
         self.tool = "pen"
         self.color = "#d3455b"
         self.pen_width = 4.0
         self._force_eraser = False
         self._tablet_active = False
+
+    @staticmethod
+    def _blank_page():
+        return {"background": None, "strokes": []}
+
+    @property
+    def page(self):
+        return self.pages[self.index]
+
+    @property
+    def background(self):
+        return self.page["background"]
+
+    @background.setter
+    def background(self, value):
+        self.page["background"] = value
+
+    @property
+    def strokes(self):
+        return self.page["strokes"]
+
+    @strokes.setter
+    def strokes(self, value):
+        self.page["strokes"] = value
+
+    def has_content(self):
+        """True once there's anything a tutor would actually lose by
+        closing the session - used to decide whether to warn on exit."""
+        return any(p["background"] is not None or p["strokes"] for p in self.pages)
+
+    def reset_session(self):
+        """Wipe every page and go back to a single, uncaptured one - used
+        when annotate mode is closed and later reopened."""
+        self.pages = [self._blank_page()]
+        self.index = 0
+        self.current = None
+
+    def go_to(self, idx):
+        if 0 <= idx < len(self.pages):
+            self.index = idx
+            self.current = None
+            self.update()
+
+    def is_captured(self):
+        """True if the page currently being viewed has a screenshot on
+        it yet."""
+        return self.background is not None
+
+    def add_blank_page(self):
+        """Insert a brand-new, uncaptured page right after the current
+        one and switch to it. No screenshot is taken here - freezing
+        happens later, when the pen tool is pressed, exactly like the
+        very first page."""
+        self.pages.insert(self.index + 1, self._blank_page())
+        self.index += 1
+        self.current = None
+        self.update()
+
+    def uncapture_current_page(self):
+        """Undo: wipe this page's screenshot and drawing and go back to
+        a blank, uncaptured page in the same slot (the page itself isn't
+        removed from the list - only its content)."""
+        self.background = None
+        self.strokes = []
+        self.current = None
+        self.update()
+
+    def delete_current_page(self):
+        """Remove the page currently being viewed. If it's the only page
+        left, clear it back to an uncaptured page instead of leaving the
+        session with nothing to show."""
+        if len(self.pages) == 1:
+            self.pages[0] = self._blank_page()
+        else:
+            self.pages.pop(self.index)
+            self.index = min(self.index, len(self.pages) - 1)
+        self.current = None
+        self.update()
 
     def freeze(self):
         self.background = QApplication.primaryScreen().grabWindow(0)
@@ -1216,12 +1301,17 @@ class OverlayToolbar(QFrame):
     # for the light paper background would be nearly invisible here.
     ICON_COLOR = "#eef1f5"
 
-    def __init__(self, overlay, on_close, on_capture):
+    def __init__(self, overlay, on_close, on_capture, on_add_page,
+                on_delete_page, on_prev_page, on_next_page, on_undo):
         super().__init__(overlay)
         self.overlay = overlay
         self.on_close = on_close
         self.on_capture = on_capture
-        self.captured = False
+        self.on_add_page = on_add_page
+        self.on_delete_page = on_delete_page
+        self.on_prev_page = on_prev_page
+        self.on_next_page = on_next_page
+        self.on_undo = on_undo
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint
                             | Qt.WindowType.WindowStaysOnTopHint
                             | Qt.WindowType.Tool)
@@ -1238,8 +1328,8 @@ class OverlayToolbar(QFrame):
         lay.setContentsMargins(10, 8, 10, 8)
         lay.setSpacing(6)
 
-        def add(name, tip, cb, checkable=False):
-            b = IconButton(name, tip, 34, self, icon_color=self.ICON_COLOR)
+        def add(name, tip, cb, checkable=False, size=34):
+            b = IconButton(name, tip, size, self, icon_color=self.ICON_COLOR)
             b.setCheckable(checkable)
             b.clicked.connect(lambda: cb())
             lay.addWidget(b)
@@ -1262,48 +1352,81 @@ class OverlayToolbar(QFrame):
         lay.addWidget(self.slider)
 
         self.b_eraser = add("eraser", "Eraser", self.pick_eraser, checkable=True)
-        self.b_trash = add("trash", "Clear all ink", overlay.clear)
-        self.b_save = add("save", "Save annotated screenshot", self.save_screenshot)
-        add("close", "Discard drawing & close (Esc)", self.close_overlay)
+        self.b_undo = add("undo", "Undo capture - clear this page and move around again",
+                          lambda: self.on_undo())
 
-        # There's nothing on screen to erase/clear/save until the
-        # screenshot has actually been taken (see pick_pen below), so
-        # these stay disabled until then.
-        self.b_eraser.setEnabled(False)
-        self.b_trash.setEnabled(False)
-        self.b_save.setEnabled(False)
+        # Multiple-screenshot navigation: flip between pages already
+        # captured in this session with the arrows, or grab a fresh
+        # screen entirely as a new page with "+".
+        self.b_prev = add("left", "Previous screenshot", self.on_prev_page, size=28)
+        self.lbl_page = QLabel("1/1", self)
+        self.lbl_page.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_page.setStyleSheet("color:#c9ced6;font-size:12px;background:transparent;")
+        self.lbl_page.setFixedSize(42, 28)
+        lay.addWidget(self.lbl_page)
+        self.b_next = add("right", "Next screenshot", self.on_next_page, size=28)
+        self.b_add = add("plus", "Start a new screenshot page", self.on_add_page)
+
+        self.b_trash = add("trash", "Delete this screenshot", self.delete_page)
+        self.b_save = add("save", "Save annotated screenshot", self.save_screenshot)
+        add("close", "Exit screen annotation (Esc)", self.close_overlay)
+
+        # Everything below only makes sense once the page being VIEWED
+        # actually has a screenshot on it - InkPad calls set_captured()/
+        # set_uncaptured() whenever the current page changes to keep
+        # this in sync (see the app's _refresh_overlay_view()).
+        self.set_uncaptured()
+        self.sync_pages()
 
         self.adjustSize()
 
     def pick_pen(self):
-        # The FIRST press of the pen button is what captures the screen -
-        # this gives the tutor a chance to switch to whatever window,
-        # slide, or app they actually want to write over before anything
-        # is grabbed. Later presses just reselect the pen tool.
+        # Pressing the pen tool is what captures the CURRENT page if it
+        # hasn't been yet - this gives the tutor a chance to switch to
+        # whatever window, slide, or app they actually want to write
+        # over before anything is grabbed. If the page is already
+        # captured, this just reselects the pen tool as normal.
         self.on_capture()
         self.overlay.tool = "pen"
         self.b_pen.setChecked(True)
         self.b_eraser.setChecked(False)
 
+    def delete_page(self):
+        self.on_delete_page()
+
     def set_captured(self):
-        """Called once the screenshot has actually been taken - unlocks
-        the tools that only make sense once there's something on screen
-        to erase, clear, or save."""
-        self.captured = True
+        """The page being viewed has a screenshot on it - unlock the
+        tools that only make sense once there's something to erase,
+        undo, delete, or save."""
         self.b_eraser.setEnabled(True)
+        self.b_undo.setEnabled(True)
+        self.b_add.setEnabled(True)
         self.b_trash.setEnabled(True)
         self.b_save.setEnabled(True)
 
-    def reset_for_new_session(self):
-        """Back to the freshly-armed, not-yet-captured state. Used when
-        annotate mode is closed and then started again."""
-        self.captured = False
+    def set_uncaptured(self):
+        """The page being viewed has no screenshot yet - lock those
+        tools and make sure the pen is what's armed, since pressing it
+        is what captures this page."""
         self.b_eraser.setEnabled(False)
+        self.b_undo.setEnabled(False)
+        self.b_add.setEnabled(False)
         self.b_trash.setEnabled(False)
         self.b_save.setEnabled(False)
         self.overlay.tool = "pen"
         self.b_pen.setChecked(True)
         self.b_eraser.setChecked(False)
+
+    def sync_pages(self):
+        """Refresh the page counter and the prev/next arrows to match how
+        many pages exist and which one is currently showing. Navigation
+        works regardless of whether the current page has been captured
+        yet, so a tutor can always flip back to an earlier screenshot."""
+        total = len(self.overlay.pages)
+        idx = self.overlay.index
+        self.lbl_page.setText(f"{idx + 1}/{total}")
+        self.b_prev.setEnabled(idx > 0)
+        self.b_next.setEnabled(idx < total - 1)
 
     def pick_eraser(self):
         self.overlay.tool = "eraser"
@@ -2055,7 +2178,7 @@ class InkPad(QMainWindow):
         self.tray.setToolTip(APP_NAME)
         menu = QMenu()
         menu.addAction("Freeze screen & annotate", self.start_overlay)
-        menu.addAction("Close annotation (discard)", self.stop_overlay)
+        menu.addAction("Close annotation", self.request_stop_overlay)
         menu.addSeparator()
         menu.addAction(f"Show {APP_NAME}", self._restore_from_tray)
         menu.addAction("Quit", self.close)
@@ -2080,15 +2203,19 @@ class InkPad(QMainWindow):
         Only the small floating toolbar appears (it stays on top), so
         the tutor is free to switch to whatever window, app, or slide
         they actually want to write over first. The screenshot itself
-        is only taken the first time they press the pen tool - see
+        is only taken when they press the pen tool - see
         capture_overlay()."""
         if self._overlay is None:
-            self._overlay = OverlayCanvas(on_escape=self.stop_overlay)
-            self._overlay_bar = OverlayToolbar(self._overlay, self.stop_overlay,
-                                               self.capture_overlay)
+            self._overlay = OverlayCanvas(on_escape=self.request_stop_overlay)
+            self._overlay_bar = OverlayToolbar(
+                self._overlay, self.request_stop_overlay, self.capture_overlay,
+                self.add_overlay_page, self.delete_overlay_page,
+                self.overlay_prev_page, self.overlay_next_page,
+                self.undo_overlay_page)
         else:
-            self._overlay.discard()
-            self._overlay_bar.reset_for_new_session()
+            self._overlay.reset_session()
+
+        self._refresh_overlay_view()
 
         bar = self._overlay_bar
         bar.adjustSize()
@@ -2098,11 +2225,31 @@ class InkPad(QMainWindow):
         bar.raise_()
         bar.activateWindow()
 
+    def _refresh_overlay_view(self):
+        """Single source of truth for what the overlay should look like
+        right now: the fullscreen drawing surface is shown only while
+        the page currently being VIEWED actually has a screenshot on
+        it; otherwise it's hidden so the tutor's desktop underneath is
+        fully usable. The toolbar's tools are enabled/disabled to
+        match. Called after every capture, undo, add, delete, or page
+        navigation."""
+        bar = self._overlay_bar
+        if self._overlay.is_captured():
+            self._overlay.show()
+            self._overlay.setFocus()
+            self._overlay.activateWindow()
+            bar.set_captured()
+        else:
+            self._overlay.hide()
+            bar.set_uncaptured()
+        bar.sync_pages()
+
     def capture_overlay(self):
-        """Actually grab the screen and reveal the drawing surface. Runs
-        the first time the pen tool is pressed after arming annotate
-        mode; does nothing on subsequent presses."""
-        if self._overlay is None or self._overlay_bar.captured:
+        """Actually grab the screen and reveal the drawing surface for
+        whichever page is currently being viewed. Runs when the pen
+        tool is pressed on a page that hasn't been captured yet; does
+        nothing if it already has been."""
+        if self._overlay is None or self._overlay.is_captured():
             return
         bar = self._overlay_bar
         # Hide the toolbar for the instant of the grab so it doesn't get
@@ -2112,19 +2259,84 @@ class InkPad(QMainWindow):
         self._overlay.freeze()
         bar.show()
         bar.raise_()
+        self._refresh_overlay_view()
 
-        self._overlay.show()
-        self._overlay.setFocus()
-        self._overlay.activateWindow()
-        bar.set_captured()
+    def add_overlay_page(self):
+        """Start a brand-new, blank page in the same session. No
+        screenshot is taken here - this only inserts an empty page and
+        makes the desktop usable again, exactly like the very first
+        page, so the tutor can move around and set up whatever they
+        want to write over next. Pressing the pen tool captures and
+        freezes it when they're ready."""
+        if self._overlay is None:
+            return
+        self._overlay.add_blank_page()
+        self._refresh_overlay_view()
+        self._overlay_bar.raise_()
+
+    def undo_overlay_page(self):
+        """Wipe the current page's screenshot and drawing and drop back
+        to the movable, uncaptured state - the tutor's desktop becomes
+        usable again, and pressing the pen tool starts the whole
+        capture process over from scratch for this page."""
+        if self._overlay is None:
+            return
+        self._overlay.uncapture_current_page()
+        self._refresh_overlay_view()
+
+    def overlay_prev_page(self):
+        if self._overlay:
+            self._overlay.go_to(self._overlay.index - 1)
+            self._refresh_overlay_view()
+
+    def overlay_next_page(self):
+        if self._overlay:
+            self._overlay.go_to(self._overlay.index + 1)
+            self._refresh_overlay_view()
+
+    def delete_overlay_page(self):
+        """Delete whichever screenshot page is currently being viewed,
+        after a confirmation - this is destructive and can't be undone,
+        the same way deleting a notebook page asks first."""
+        if self._overlay is None or not self._overlay.is_captured():
+            return
+        if self._confirm(
+                "Delete this screenshot?",
+                "This screenshot and any drawing on it will be permanently deleted.",
+                confirm_text=QMessageBox.StandardButton.Yes):
+            self._overlay.delete_current_page()
+            self._refresh_overlay_view()
+
+    def request_stop_overlay(self):
+        """Confirm before throwing away an in-progress annotation session
+        (Esc, the toolbar's close button, or the tray menu all route
+        through here) - only warns if there's actually something on
+        screen that would be lost."""
+        if self._overlay and self._overlay.has_content():
+            if not self._confirm(
+                    "Exit screen annotation?",
+                    "All screenshots and drawings from this session will be discarded.",
+                    confirm_text=QMessageBox.StandardButton.Discard):
+                return
+        self.stop_overlay()
+
+    def _confirm(self, title, message, confirm_text):
+        """Small always-on-top Yes/Cancel-style dialog. Needed because the
+        overlay's own windows are frameless and stay on top of
+        everything, so a normal parented dialog could end up hidden
+        behind them."""
+        box = QMessageBox(QMessageBox.Icon.Warning, title, message,
+                          confirm_text | QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(QMessageBox.StandardButton.Cancel)
+        box.setWindowFlags(box.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
+        return box.exec() == confirm_text
 
     def stop_overlay(self):
         if self._overlay:
             self._overlay.hide()
-            self._overlay.discard()
+            self._overlay.reset_session()
         if self._overlay_bar:
             self._overlay_bar.hide()
-            self._overlay_bar.reset_for_new_session()
         self.showNormal()
         self.activateWindow()
 
